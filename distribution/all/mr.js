@@ -50,6 +50,7 @@ const mr = function(config) {
             let talkFuncString = `
               let talkFunc = ${talkRPC.toString()};
               talkFunc(global.nodeConfig, () => {});
+              arguments[0]();
             `;
             let totalTalkFunction = Function(talkFuncString);
 
