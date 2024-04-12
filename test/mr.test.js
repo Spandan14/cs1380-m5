@@ -128,6 +128,7 @@ test('(25 pts) all.mr:ncdc', (done) => {
   const doMapReduce = (cb) => {
     distribution.ncdc.store.get(null, (e, v) => {
       try {
+        console.log(v);
         expect(v.length).toBe(dataset.length);
       } catch (e) {
         done(e);

@@ -31,6 +31,7 @@ store.get = function(key, callback) {
   if (!key.key) {
     let folderPath = path.join(__dirname, '../../store/',
         id.getNID(global.nodeConfig), '/', key.gid);
+    console.log(folderPath);
     fs.readdir(folderPath, function(err, files) {
       if (err) {
         callback(null, {});

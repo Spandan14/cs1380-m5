@@ -5,7 +5,9 @@ const mr = function(config) {
 
   let mapCompletions = 0;
   let mappedKeys = new Set();
+
   let reduceCompletions = 0;
+  let reducedKeys = new Set();
 
   const MAP_COMPLETION_MESSAGE = 'MAP_COMPLETE';
   const REDUCE_COMPLETION_MESSAGE = 'REDUCE_COMPLETE';
@@ -13,6 +15,7 @@ const mr = function(config) {
   let looper = (arr, func, i, continuation) => {
     if (i >= arr.length) {
       continuation();
+      return;
     }
 
     func(arr[i], (e, v) => {
@@ -34,14 +37,13 @@ const mr = function(config) {
         configuration.compact = (results) => {
           let compacted = {};
           for (let i = 0; i < results.length; i++) {
-            let key = results[i].key;
-            let value = results[i].value;
+            for (let [key, value] of Object.entries(results[i])) {
+              if (!compacted[key]) {
+                compacted[key] = [];
+              }
 
-            if (!compacted[key]) {
-              compacted[key] = [];
+              compacted[key].push(value);
             }
-
-            compacted[key].push(value);
           }
 
           return compacted;
@@ -88,24 +90,193 @@ const mr = function(config) {
               if (mapCompletions === Object.keys(group).length) {
                 // all maps are done
                 // get all the data
-                let results = [];
+                let mapResults = [];
+                let reducerKeys = [];
                 let resultGetter = (key, callback) => {
-                  distribution[context.gid].store.get(key, (e, v) => {
+                  let hash = util.id.getID(key);
+                  let hashedKey = `mr-mapResult-${mapReduceID}-${hash}`;
+                  distribution[context.gid].store.get(hashedKey, (e, v) => {
                     if (e) {
                       console.log('Error getting result: ', e);
                     }
 
-                    results.push(v);
+                    mapResults.push(v);
+                    // i think 34 works here
+                    reducerKeys.push(key);
                     callback(e, v);
                   });
                 };
 
                 looper(Array.from(mappedKeys), resultGetter, 0, () => {
-                  callback(null, results);
+                  // all results are in
+
+                  // setup reduce system
+                  let thisNode = global.nodeConfig;
+                  let reduceRoutine = (keys, values, callback) => {
+                    console.log('REDUCTION KEYS: ', keys);
+                    // compute reduce on payload
+                    results = [];
+
+                    for (let i = 0; i < keys.length; i++) {
+                      let reduced = configuration.reduce(keys[i], values[i]);
+
+                      for (let [key, value] of Object.entries(reduced)) {
+                        results.push({key: key, value: value});
+                      }
+                    };
+
+                    // TODO: check if we need to compact here
+
+                    let finalKeys = [];
+                    let distributor = (obj, callback) => {
+                      let hash = util.id.getID(obj.key);
+                      finalKeys.push(obj.key);
+                      let hashedKey = `mr-reduceResult-${mapReduceID}-${hash}`;
+                      distribution[context.gid].store.append(obj.value,
+                          hashedKey, callback);
+                    };
+                    looper(results, distributor, 0, () => {
+                      // setup notification
+                      let remote = {service: mrNotificationServiceID,
+                        method: 'notify', node: thisNode};
+
+                      let payload = [REDUCE_COMPLETION_MESSAGE, finalKeys];
+
+                      // send notification
+                      distribution.local.comm.send(payload, remote, (e, v) => {
+                        if (e) {
+                          console.log('Error sending message to leader: ', e);
+                        }
+                        callback(e, v);
+                      });
+                    });
+                  };
+
+                  let reduceRPC = util.wire.createRPC(util.wire.
+                      toAsync(reduceRoutine));
+
+                  let reduceFuncString = `
+                    let reduceFunc = ${reduceRPC.toString()};
+                    reduceFunc(arguments[0], arguments[1], arguments[2]);
+                  `;
+
+                  let reduceFunction = Function(reduceFuncString);
+
+                  const mrReduceServiceID = `mr-reduce-${mapReduceID}`;
+
+                  // now register services remotely on other nodes in the group
+                  remote = {service: 'routes', method: 'put'};
+                  payload = [{reduce: reduceFunction}, mrReduceServiceID];
+
+
+                  distribution[context.gid].comm.send(payload,
+                      remote, (e, v) => {
+                        if (e) {
+                          console.log('Error setting up reduce system: ', e);
+                        }
+
+                        // distribute to reduce
+                        let keySets = [];
+                        let valueSets = [];
+                        let setSize = Math.ceil(mapResults.length /
+                          Object.keys(group).length);
+
+                        for (let i = 0; i < mapResults.length; i += setSize) {
+                          keySets.push(Array.from(reducerKeys).
+                              slice(i, i + setSize));
+                          valueSets.push(mapResults.slice(i, i + setSize));
+                        }
+
+                        let groupList = Object.values(group);
+
+                        let reduceSender = (i, callback) => {
+                          let remote = {service: mrReduceServiceID,
+                            method: 'reduce',
+                            node: groupList[i]};
+                          let payload = [keySets[i], valueSets[i]];
+
+                          distribution.local.comm.send(payload, remote,
+                              (e, v) => {
+                                if (e) {
+                                  console.log('Error sending reduce request: ',
+                                      e);
+                                }
+
+                                callback(e, v);
+                              });
+                        };
+
+                        let indices = Array.from({length: groupList.length},
+                            (v, i) => i);
+                        looper(indices, reduceSender, 0, () => {});
+                      });
                 });
               }
             } else if (msg === REDUCE_COMPLETION_MESSAGE) {
-              reduceCompletions.add(nid);
+              reduceCompletions++;
+              for (let i = 0; i < keys.length; i++) {
+                reducedKeys.add(keys[i]);
+              }
+              if (reduceCompletions === Object.keys(group).length) {
+                // all reduces are done
+                // get all the data
+                let reduceResults = [];
+                let resultGetter = (key, cb) => {
+                  console.log('GETTING KEY RESULT: ', key);
+
+                  let hash = util.id.getID(key);
+                  let hashedKey = `mr-reduceResult-${mapReduceID}-${hash}`;
+                  distribution[context.gid].store.get(hashedKey, (e, v) => {
+                    if (e) {
+                      console.log('Error getting result: ', e);
+                    }
+
+                    reduceResults.push(v);
+                    cb(e, v);
+                  });
+                };
+
+                looper(Array.from(reducedKeys), resultGetter, 0, () => {
+                  console.log('IN FINAL COLLECTION');
+                  // all results are in
+                  // callback with final results
+                  let output = [];
+                  for (let i = 0; i < reduceResults.length; i++) {
+                    let key = Array.from(reducedKeys)[i];
+                    let finalKey = key;
+
+                    if (!key) {
+                      continue;
+                    }
+
+                    let value = reduceResults[i];
+                    let obj = {};
+                    obj[finalKey] = value[0];
+                    output.push(obj);
+                  }
+
+                  console.log('OUTPUT: ', output);
+
+                  // clean up all the files
+                  let mapCleaner = (key, cb) => {
+                    let hash = util.id.getID(key);
+                    let hashedKey = `mr-mapResult-${mapReduceID}-${hash}`;
+                    distribution[context.gid].store.del(hashedKey, cb);
+                  };
+
+                  let reduceCleaner = (key, cb) => {
+                    let hash = util.id.getID(key);
+                    let hashedKey = `mr-reduceResult-${mapReduceID}-${hash}`;
+                    distribution[context.gid].store.del(hashedKey, cb);
+                  };
+
+                  looper(Array.from(mappedKeys), mapCleaner, 0, () => {
+                    looper(Array.from(reducedKeys), reduceCleaner, 0, () => {
+                      callback(null, output);
+                    });
+                  });
+                });
+              }
             }
           };
 
@@ -122,8 +293,6 @@ const mr = function(config) {
                 // setup MAP service for remote nodes
                 let thisNode = global.nodeConfig;
                 let mapRoutine = (keys, values, callback) => {
-                  // get everything
-
                   // compute map on payload
                   results = [];
                   // TODO: may need to make this async-friendly
@@ -131,13 +300,19 @@ const mr = function(config) {
                     let mapped = configuration.map(keys[i], values[i]);
 
                     // mapped can give multiple outputs
-                    for (let [key, value] of Object.entries(mapped)) {
-                      results.push({key: key, value: value});
+                    if (!Array.isArray(mapped)) {
+                      mapped = [mapped];
+                    }
+
+                    for (let object of mapped) {
+                      results.push(object);
                     }
                   }
 
                   // compact results of map
+                  console.log('PRE COMPACTION, ', results);
                   compactedResults = configuration.compact(results);
+                  console.log('POST COMPACTION, ', compactedResults);
                   results = [];
                   for (let [key, value] of Object.entries(compactedResults)) {
                     results.push({key: key, value: value});
@@ -148,10 +323,11 @@ const mr = function(config) {
                   // shuffle results of map in a distributed way
                   // grouping happens at the same time with append
                   let shuffler = (obj, callback) => {
-                    let objKey = `mr-mapResult-${mapReduceID}-${obj.key}`;
-                    finalKeys.push(objKey);
+                    finalKeys.push(obj.key);
+                    let hash = util.id.getID(obj.key);
+                    let fileKey = `mr-mapResult-${mapReduceID}-${hash}`;
                     distribution[context.gid].store.append(obj.value,
-                        objKey, callback);
+                        fileKey, callback);
                   };
                   looper(results, shuffler, 0, () => {
                     // setup notification
@@ -197,8 +373,10 @@ const mr = function(config) {
                   let valueSets = [];
                   let setSize = Math.ceil(configuration.keys.length /
                     Object.keys(group).length);
-                  for (let i = 0; i < configuration.keys.length; i += setSize) {
-                    keySets.push(configuration.keys.slice(i, i + setSize));
+                  for (let i = 0; i < configuration.keys.length;
+                    i += setSize) {
+                    keySets.push(configuration.keys.slice(i,
+                        i + setSize));
                     valueSets.push(values.slice(i, i + setSize));
                   };
 
@@ -209,13 +387,14 @@ const mr = function(config) {
                       node: groupList[i]};
                     let payload = [keySets[i], valueSets[i]];
 
-                    distribution.local.comm.send(payload, remote, (e, v) => {
-                      if (e) {
-                        console.log('Error sending map request: ', e);
-                      }
+                    distribution.local.comm.send(payload, remote,
+                        (e, v) => {
+                          if (e) {
+                            console.log('Error sending map request: ', e);
+                          }
 
-                      callback(e, v);
-                    });
+                          callback(e, v);
+                        });
                   };
                   let indices = Array.from({length: groupList.length},
                       (v, i) => i);

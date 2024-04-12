@@ -30,7 +30,12 @@ let store = (config) => {
 
         if (!key.key) {
           distribution[context.gid].comm.send(payload, remote, (e, v) => {
-            callback(e, Object.values(v).flat());
+            // remove empty arrays from v
+            let res = Object.values(v).flat();
+            res = res.filter((el) => {
+              return el.length > 0;
+            });
+            callback(e, res);
           });
           return;
         }
