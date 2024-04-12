@@ -3,8 +3,9 @@ const mr = function(config) {
   context.gid = config.gid || 'all';
   const util = global.distribution.util;
 
-  let mapCompletions = new Set();
-  let reduceCompletions = new Set();
+  let mapCompletions = 0;
+  let mappedKeys = new Set();
+  let reduceCompletions = 0;
 
   const MAP_COMPLETION_MESSAGE = 'MAP_COMPLETE';
   const REDUCE_COMPLETION_MESSAGE = 'REDUCE_COMPLETE';
@@ -75,16 +76,33 @@ const mr = function(config) {
 
           // setup notification service
           let mrNotificationService = {};
-          mrNotificationService.notify = (msg, nid) => {
-            console.log(`NOTIFICATION RECEIVED FROM ${nid}: `, msg);
+          mrNotificationService.notify = (msg, keys) => {
+            console.log(`NOTIFICATION RECEIVED: `, msg);
+            console.log(`KEYS: `, keys);
 
             if (msg === MAP_COMPLETION_MESSAGE) {
-              mapCompletions.add(nid);
-              console.log("MAP COMPLETIONS: ", mapCompletions.size);
-              if (mapCompletions.size === Object.keys(group).length) {
-              // all maps are done
-                console.log('WHAT THE FUCK ALL MAPS ARE DONE SHEESH!');
-                callback(null, null);
+              mapCompletions++;
+              for (let i = 0; i < keys.length; i++) {
+                mappedKeys.add(keys[i]);
+              }
+              if (mapCompletions === Object.keys(group).length) {
+                // all maps are done
+                // get all the data
+                let results = [];
+                let resultGetter = (key, callback) => {
+                  distribution[context.gid].store.get(key, (e, v) => {
+                    if (e) {
+                      console.log('Error getting result: ', e);
+                    }
+
+                    results.push(v);
+                    callback(e, v);
+                  });
+                };
+
+                looper(Array.from(mappedKeys), resultGetter, 0, () => {
+                  callback(null, results);
+                });
               }
             } else if (msg === REDUCE_COMPLETION_MESSAGE) {
               reduceCompletions.add(nid);
@@ -103,7 +121,7 @@ const mr = function(config) {
 
                 // setup MAP service for remote nodes
                 let thisNode = global.nodeConfig;
-                let mapRoutine = (keys, values, identity, callback) => {
+                let mapRoutine = (keys, values, callback) => {
                   // get everything
 
                   // compute map on payload
@@ -125,12 +143,13 @@ const mr = function(config) {
                     results.push({key: key, value: value});
                   }
 
-                  console.log("RESULTS OF MAP: ", results);
+                  let finalKeys = [];
 
                   // shuffle results of map in a distributed way
                   // grouping happens at the same time with append
                   let shuffler = (obj, callback) => {
                     let objKey = `mr-mapResult-${mapReduceID}-${obj.key}`;
+                    finalKeys.push(objKey);
                     distribution[context.gid].store.append(obj.value,
                         objKey, callback);
                   };
@@ -138,8 +157,8 @@ const mr = function(config) {
                     // setup notification
                     let remote = {service: mrNotificationServiceID,
                       method: 'notify', node: thisNode};
-                    let payload = [MAP_COMPLETION_MESSAGE,
-                      util.id.getNID(identity)];
+
+                    let payload = [MAP_COMPLETION_MESSAGE, finalKeys];
 
                     // send notification
                     distribution.local.comm.send(payload, remote, (e, v) => {
@@ -156,9 +175,7 @@ const mr = function(config) {
 
                 let mapFuncString = `
                   let mapFunc = ${mapRPC.toString()};
-                  mapFunc(arguments[0], arguments[1], global.distribution.
-                    util.id.getNID(global.nodeConfig),
-                    arguments[2]);
+                  mapFunc(arguments[0], arguments[1], arguments[2]);
                 `;
 
                 let mapFunction = Function(mapFuncString);
@@ -202,7 +219,7 @@ const mr = function(config) {
                   };
                   let indices = Array.from({length: groupList.length},
                       (v, i) => i);
-                  looper(indices, mapSender, 0);
+                  looper(indices, mapSender, 0, () => {});
                 });
               });
         });

@@ -2,7 +2,7 @@ let store = (config) => {
   let context = {};
   const util = global.distribution.util;
   context.gid = config.gid || 'all';
-  context.hash = config.hash || util.id.naiveHash;
+  context.hash = config.hash || util.id.consistentHash;
 
   return {
     'get': function(key, callback) {
@@ -92,11 +92,6 @@ let store = (config) => {
         }
 
         let nodeToCheck = v[context.hash(util.id.getID(key), Object.keys(v))];
-
-        key = {
-          key: key,
-          gid: context.gid,
-        };
 
         let payload = [value, key];
         let remote = {

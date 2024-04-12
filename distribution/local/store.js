@@ -114,17 +114,24 @@ store.append = function(value, key, callback) {
     key.key = id.getID(value);
   }
 
+  if (!Array.isArray(value)) {
+    value = [value];
+  }
+
   store.get(key, function(err, data) {
     if (err) {
       if (err.message === 'Key not found') {
-        store.put([value], key, callback);
+        store.put(value, key, callback);
       }
     } else {
       if (!Array.isArray(data)) {
         data = [data];
       }
 
-      data.push(value);
+      for (let i = 0; i < value.length; i++) {
+        data.push(value[i]);
+      }
+
       store.put(data, key, callback);
     }
   });
